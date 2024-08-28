@@ -1,105 +1,140 @@
+import logging
 from dune_client.client import DuneClient
 import pandas as pd
-dune = DuneClient("API-KEY")  #Replace with your Dune API Key inside quotes <==========================================
-query_result = dune.get_latest_result(4022616) #Replace with your Query Number <==================================== https://dune.com/queries/4022616 at this link you can find the query to use this code by changing takerAssetId and makerAssetId
+from collections import deque
+from typing import Tuple
 
-# Extract rows from the ExecutionResult object
-rows = query_result.result.rows
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Convert rows into a pandas DataFrame
-df = pd.DataFrame(rows)
-# Convert the transactionTime column to datetime and ensure it is timezone-aware
-df['transactionTime'] = pd.to_datetime(df['transactionTime']).dt.tz_convert('UTC')
+def fetch_data(api_key: str, query_id: int) -> pd.DataFrame:
+    """
+    Fetch data from Dune Analytics API.
 
-# Define the cutoff time and make it timezone-aware
-cutoff_time = pd.Timestamp('2024-07-23 18:00:00', tz='UTC') # Change Cutoff Time <======================================================
+    Parameters:
+    api_key (str): API key for Dune Analytics.
+    query_id (int): Query ID to fetch the latest result.
 
-# Filter the DataFrame for buys before the cutoff time
-buys_before_cutoff = df[(df['transactionType'] == 'Buy') & (df['transactionTime'] < cutoff_time)]
+    Returns:
+    pd.DataFrame: DataFrame containing the query result.
+    """
+    try:
+        logging.info("Fetching data from Dune Analytics...")
+        dune = DuneClient(api_key)
+        query_result = dune.get_latest_result(query_id)
+        rows = query_result.result.rows
+        return pd.DataFrame(rows)
+    except Exception as e:
+        logging.error(f"Error fetching data: {e}")
+        raise
 
-# Group by address and calculate totalSharesBought and avgBuyPrice
-grouped_buys = buys_before_cutoff.groupby('address').agg(
-    totalSharesBought=('shares', 'sum'),
-    avgBuyPrice=('pricePerShare', 'mean')
-).reset_index()
+def preprocess_data(df: pd.DataFrame, cutoff_time: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Preprocess the data by filtering buys before the cutoff time and all sells.
 
-# Filter the DataFrame for all sells
-sells = df[df['transactionType'] == 'Sell']
+    Parameters:
+    df (pd.DataFrame): DataFrame containing the raw data.
+    cutoff_time (str): Cutoff time in 'YYYY-MM-DD HH:MM:SS' format.
 
-# Initialize columns for the final DataFrame
-grouped_buys['totalSharesSold'] = 0.0
-grouped_buys['avgSellPrice'] = 0.0
-grouped_buys['realizedProfit'] = 0.0
-grouped_buys['unrealizedProfit_85cents_per_share''] = 0.0  #<====================================================== Change Column Name Here from 85 to current price
-grouped_buys['costBasisForAllSharesBought'] = grouped_buys['totalSharesBought'] * grouped_buys['avgBuyPrice']
-grouped_buys['unsoldShares'] = 0.0
-grouped_buys['percentageSharesSold'] = 0.0
-grouped_buys['ROI (Realized)'] = 0.0
-grouped_buys['ROI (With Unrealized)'] = 0.0
+    Returns:
+    Tuple[pd.DataFrame, pd.DataFrame]: DataFrames containing buys before the cutoff time and all sells.
+    """
+    logging.info("Preprocessing data...")
+    df['transactionTime'] = pd.to_datetime(df['transactionTime']).dt.tz_convert('UTC')
+    cutoff_time = pd.Timestamp(cutoff_time, tz='UTC')
+    buys = df[(df['transactionType'] == 'Buy') & (df['transactionTime'] < cutoff_time)]
+    sells = df[df['transactionType'] == 'Sell']
+    return buys, sells
 
-# Function to calculate profits using FIFO
-def calculate_profits(address, buys, sells):
-    total_shares_sold = 0
-    total_sell_value = 0
-    realized_profit = 0
-    remaining_buys = buys.copy()
+def calculate_profits(buys: pd.DataFrame, sells: pd.DataFrame, unsold_share_value: float) -> pd.DataFrame:
+    logging.info("Calculating profits...")
     
-    for _, sell in sells.iterrows():
-        shares_to_sell = sell['shares']
-        while shares_to_sell > 0 and not remaining_buys.empty:
-            buy = remaining_buys.iloc[0]
-            if buy['shares'] <= shares_to_sell:
-                shares_to_sell -= buy['shares']
-                total_shares_sold += buy['shares']
-                total_sell_value += buy['shares'] * sell['pricePerShare']
-                realized_profit += buy['shares'] * (sell['pricePerShare'] - buy['pricePerShare'])
-                remaining_buys = remaining_buys.iloc[1:]
-            else:
-                total_shares_sold += shares_to_sell
-                total_sell_value += shares_to_sell * sell['pricePerShare']
-                realized_profit += shares_to_sell * (sell['pricePerShare'] - buy['pricePerShare'])
-                remaining_buys.at[remaining_buys.index[0], 'shares'] -= shares_to_sell
-                shares_to_sell = 0
-    
-    total_shares_bought = buys['shares'].sum()
-    avg_sell_price = total_sell_value / total_shares_sold if total_shares_sold > 0 else 0
-    unrealized_profit = (remaining_buys['shares'] * (0.85 - remaining_buys['pricePerShare'])).sum() # <================================================ Change value of current shares here 
-    cost_basis = total_shares_bought * buys['pricePerShare'].mean()
-    percentage_shares_sold = (total_shares_sold / total_shares_bought) * 100
-    roi_realized = (realized_profit / cost_basis) * 100 if cost_basis > 0 else 0
-    roi_with_unrealized = ((realized_profit + unrealized_profit) / cost_basis) * 100 if cost_basis > 0 else 0
-    unsold_shares = remaining_buys['shares'].sum()
-    
-    return total_shares_sold, avg_sell_price, realized_profit, unrealized_profit, cost_basis, percentage_shares_sold, roi_realized, roi_with_unrealized, unsold_shares
+    results = []
+    addresses = buys['address'].unique()
 
-# Calculate profits for each address
-for i, row in grouped_buys.iterrows():
-    address = row['address']
-    address_buys = buys_before_cutoff[buys_before_cutoff['address'] == address]
-    address_sells = sells[sells['address'] == address]
+    for address in addresses:
+        address_buys = buys[buys['address'] == address]
+        address_sells = sells[sells['address'] == address]
+        
+        total_shares_bought = address_buys['shares'].sum()
+        total_cost_bought = address_buys['amountUSDC'].sum()
+        weighted_avg_buy_price = total_cost_bought / total_shares_bought
+
+        fifo_queue = deque()
+        realized_profit = 0
+        total_shares_sold = 0
+
+        transactions = pd.concat([address_buys, address_sells]).sort_values(by='transactionTime')
+
+        for _, row in transactions.iterrows():
+            if row['transactionType'] == 'Buy':
+                fifo_queue.append((row['shares'], row['pricePerShare']))
+            elif row['transactionType'] == 'Sell':
+                shares_to_sell = row['shares']
+                sell_price = row['pricePerShare']
+                while shares_to_sell > 0 and fifo_queue:
+                    bought_shares, bought_price = fifo_queue.popleft()
+                    if bought_shares <= shares_to_sell:
+                        cost_basis = bought_shares * bought_price
+                        profit = (sell_price - bought_price) * bought_shares
+                        shares_to_sell -= bought_shares
+                        total_shares_sold += bought_shares
+                    else:
+                        cost_basis = shares_to_sell * bought_price
+                        profit = (sell_price - bought_price) * shares_to_sell
+                        fifo_queue.appendleft((bought_shares - shares_to_sell, bought_price))
+                        total_shares_sold += shares_to_sell
+                        shares_to_sell = 0
+                    realized_profit += profit
+
+        total_unsold_shares = sum(shares for shares, _ in fifo_queue)
+        current_value_unsold_shares = total_unsold_shares * unsold_share_value
+        cost_basis_unsold_shares = sum(shares * price for shares, price in fifo_queue)
+        unrealized_profit = current_value_unsold_shares - cost_basis_unsold_shares
+        total_profit = realized_profit + unrealized_profit
+        roi_realized = (realized_profit / total_cost_bought) * 100 if total_cost_bought > 0 else 0
+        roi_with_unrealized = (total_profit / total_cost_bought) * 100 if total_cost_bought > 0 else 0
+        percent_shares_sold = (total_shares_sold / total_shares_bought) * 100
+
+        # Apply rounding to avoid extremely small amounts
+        total_unsold_shares = 0 if total_unsold_shares < 0.01 else total_unsold_shares
+        unrealized_profit = 0 if abs(unrealized_profit) < 0.01 else unrealized_profit
+        realized_profit = 0 if abs(realized_profit) < 0.01 else realized_profit
+        total_profit = 0 if abs(total_profit) < 0.01 else total_profit
+        roi_realized = 0 if abs(roi_realized) < 0.01 else roi_realized
+        roi_with_unrealized = 0 if abs(roi_with_unrealized) < 0.01 else roi_with_unrealized
+
+        results.append({
+            'address': address,
+            'totalSharesBought': total_shares_bought,
+            'avgBuyPrice': weighted_avg_buy_price,
+            'totalSharesSold': total_shares_sold,
+            'avgSellPrice': address_sells['amountUSDC'].sum() / address_sells['shares'].sum() if address_sells['shares'].sum() != 0 else 0,
+            'realizedProfit': realized_profit,
+            f'unrealizedProfit (Unsold Share Value: {unsold_share_value})': unrealized_profit,
+            'totalProfit': total_profit,
+            'ROI (Realized)': roi_realized,
+            'ROI (With Unrealized)': roi_with_unrealized,
+            'costBasisForAllSharesBought': total_cost_bought,
+            'unsoldShares': total_unsold_shares,
+            'percentageSharesSold': percent_shares_sold
+        })
+
+    return pd.DataFrame(results)
+
+def main():
+    api_key = "API-KEY" #<==========================Insert Dune API Key In quotes
+    query_id = 4022616 # <===================== Change Query ID (Must use format from my queries for this to work)
+    cutoff_time = '2024-07-23 18:00:00' #<==================Change Cutoff Time / Date
+    unsold_share_value = 0.85  # <========================= Custom parameter for the value of unsold shares 
     
-    (total_shares_sold, avg_sell_price, realized_profit, unrealized_profit, cost_basis, percentage_shares_sold, roi_realized, roi_with_unrealized, unsold_shares) = calculate_profits(address, address_buys, address_sells)
+    df = fetch_data(api_key, query_id)
+    buys, sells = preprocess_data(df, cutoff_time)
+    results = calculate_profits(buys, sells, unsold_share_value)
     
-    grouped_buys.at[i, 'totalSharesSold'] = float(total_shares_sold)
-    grouped_buys.at[i, 'avgSellPrice'] = float(avg_sell_price)
-    grouped_buys.at[i, 'realizedProfit'] = float(realized_profit)
-    grouped_buys.at[i, 'unrealizedProfit_85cents_per_share'] = float(unrealized_profit) #<========================================== Change Column Name Here from 85 to current price
-    grouped_buys.at[i, 'costBasisForAllSharesBought'] = float(cost_basis)
-    grouped_buys.at[i, 'unsoldShares'] = float(unsold_shares)
-    grouped_buys.at[i, 'percentageSharesSold'] = float(percentage_shares_sold)
-    grouped_buys.at[i, 'ROI (Realized)'] = float(roi_realized)
-    grouped_buys.at[i, 'ROI (With Unrealized)'] = float(roi_with_unrealized)
+    results = results.sort_values(by='totalProfit', ascending=False)
+    print(results)
+    results.to_csv('will_biden_finish_his_term_yes_active.csv', index=False)
 
-# Reorder the columns
-grouped_buys = grouped_buys[[
-    'address', 'totalSharesBought', 'avgBuyPrice', 'totalSharesSold', 'avgSellPrice', 
-    'realizedProfit', 'unrealizedProfit_85cents_per_share', 'ROI (Realized)', 'ROI (With Unrealized)', #<========================================== Change Column Name Here from 85 to current price
-    'costBasisForAllSharesBought', 'unsoldShares', 'percentageSharesSold'
-]]
-
-# Sort the final DataFrame by realized profits in descending order
-grouped_buys = grouped_buys.sort_values(by='realizedProfit', ascending=False)
-
-# Display the final DataFrame
-print(grouped_buys)
-grouped_buys.to_csv('will_biden_finish_his_term_yes_active.csv', index=False) # Change File Name <============================================================
+if __name__ == "__main__":
+    main()
