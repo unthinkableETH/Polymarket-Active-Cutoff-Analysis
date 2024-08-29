@@ -134,7 +134,7 @@ def main():
     
     results = results.sort_values(by='totalProfit', ascending=False)
     print(results)
-    results.to_csv('will_biden_finish_his_term_yes_active.csv', index=False)
+    results.to_csv('will_biden_finish_his_term_yes_active.csv', index=False) #<================================== Change file name
 
 if __name__ == "__main__":
     main()
